@@ -1,15 +1,39 @@
-//! By convention, root.zig is the root source file when making a package.
+//! RWKV-7 inference engine — model loading, forward pass, and SIMD-optimized compute kernels.
+//!
+//! Architecture overview:
+//!   RWKV-7 is an RNN-based language model that replaces the quadratic attention of
+//!   Transformers with a linear-time recurrence. Each block has two sub-layers:
+//!     1. Time-mixing (attention analogue) — multi-head WKV recurrence with LoRA gates
+//!     2. Channel-mixing (FFN analogue) — squared-ReLU feed-forward network
+//!
+//! Weight format:
+//!   Binary file with a 56-byte Header, followed by fp32 weights in per-block order.
+//!   Compatible with rwkv7.c (https://github.com/KevlarKanou/rwkv7.c).
+//!
+//! SIMD strategy:
+//!   All vector kernels use Zig's `@Vector` builtins. The main loop processes
+//!   DEFAULT_VECTOR_WIDTH elements (8 on AVX2, 4 on NEON) per iteration, with a
+//!   scalar tail for remaining elements. FMA is emitted via `@mulAdd`.
+
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
-const MAGIC_NUMBER: u64 = 0x00632E37766B7772; // rwkv7.c\0
+/// Binary file magic number — matches rwkv7.c format.
+const MAGIC_NUMBER: u64 = 0x00632E37766B7772; // "rwkv7.c\0" in little-endian
 
+/// SIMD vector width: 8 on AVX2 (256-bit), 4 on SSE/NEON (128-bit), fallback 4.
 const DEFAULT_VECTOR_WIDTH: usize = std.simd.suggestVectorLength(f32) orelse 4;
 const simd_align: comptime_int = @alignOf(@Vector(DEFAULT_VECTOR_WIDTH, f32));
 const simd_alignment = std.mem.Alignment.of(@Vector(DEFAULT_VECTOR_WIDTH, f32));
 
+// ---------------------------------------------------------------------------
+// Tokenizer
+// ---------------------------------------------------------------------------
+
+/// BPE tokenizer that loads from a binary vocab file.
+/// Binary format: [vocab_size:u32] then for each token: [score:u32] [len:u32] [data:u8*len]
 pub const Tokenizer = struct {
     const Self = @This();
 
@@ -69,6 +93,8 @@ pub const Tokenizer = struct {
         allocator.free(self.scores);
     }
 
+    /// Greedy longest-match encoding: at each position, find the vocab token with
+    /// the highest score that matches the input text starting at that position.
     pub fn encode(self: *const Self, text: []const u8, allocator: Allocator) ![]u32 {
         var tokens = try allocator.alloc(u32, 0);
         var i: usize = 0;
@@ -101,12 +127,26 @@ pub const Tokenizer = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// RunState — persistent hidden state across token generations
+// ---------------------------------------------------------------------------
+
+/// Mutable inference state that persists across forward calls.
+/// All buffers are SIMD-aligned for efficient vector loads/stores.
 pub const RunState = struct {
     const Self = @This();
 
-    last_x: []align(simd_align) f32, // (n_layer, 2, n_embd)
-    wkv_state: []align(simd_align) f32, // (n_layer, n_head, head_size, head_size)
-    scratch: []align(simd_align) f32, // intermediate buffer
+    /// Previous token's input per layer, used for lerp mixing.
+    /// Layout: (n_layer, 2, n_embd) — index 0 for time-mixing, 1 for channel-mixing.
+    last_x: []align(simd_align) f32,
+
+    /// WKV recurrence state per layer per head.
+    /// Layout: (n_layer, n_head, head_size, head_size)
+    wkv_state: []align(simd_align) f32,
+
+    /// Scratch buffer shared across time_mixing and channel_mixing (called sequentially).
+    /// Size: 32 * n_embd floats, sub-allocated into ~12 named regions.
+    scratch: []align(simd_align) f32,
 
     pub fn init(allocator: Allocator, model: *const Model) !Self {
         const n_layer: usize = @intCast(model.header.n_layer);
@@ -128,71 +168,96 @@ pub const RunState = struct {
     }
 };
 
-/// Matches the C rwkv7.c header layout exactly.
+// ---------------------------------------------------------------------------
+// Model header and per-block weights
+// ---------------------------------------------------------------------------
+
+/// 56-byte file header — must match the C rwkv7.c packed struct exactly.
 const Header = extern struct {
     magic_number: u64,
-    quant: i32,
-    head_size: i32,
-    n_embd: i32,
-    n_layer: i32,
-    vocab_size: i32,
-    w_lora_r: i32,
-    a_lora_r: i32,
-    g_lora_r: i32,
-    v_lora_r: i32,
-    de: i32,
-    dea: i32,
-    s_lora_r: i32,
+    quant: i32, // 0 = fp32, non-zero = quantized (not supported)
+    head_size: i32, // attention head dimension (e.g. 64)
+    n_embd: i32, // embedding dimension (e.g. 768)
+    n_layer: i32, // number of transformer blocks
+    vocab_size: i32, // vocabulary size (e.g. 65536)
+    w_lora_r: i32, // LoRA rank for time-decay (w) gate
+    a_lora_r: i32, // LoRA rank for bonus (a) gate
+    g_lora_r: i32, // LoRA rank for output gate (g)
+    v_lora_r: i32, // LoRA rank for value blending gate
+    de: i32, // dynamic expansion flag (not used in this impl)
+    dea: i32, // dynamic expansion attention flag
+    s_lora_r: i32, // LoRA rank for dynamic expansion
 };
 
-/// Per-block weights, matching C's block_weights layout.
+/// All weight pointers for a single transformer block.
+/// Pointers point into the memory-mapped model_data buffer.
 pub const BlockWeights = struct {
+    // Layer norms
     ln1_weight: [*]f32,
     ln1_bias: [*]f32,
     ln2_weight: [*]f32,
     ln2_bias: [*]f32,
-    att_x_r: [*]f32,
-    att_x_w: [*]f32,
-    att_x_k: [*]f32,
-    att_x_v: [*]f32,
-    att_x_a: [*]f32,
-    att_x_g: [*]f32,
-    att_w0: [*]f32,
-    att_r_k: [*]f32,
-    att_w1_T: [*]f32,
-    att_w2_T: [*]f32,
-    att_a1_T: [*]f32,
-    att_a2_T: [*]f32,
-    att_a0: [*]f32,
-    att_g1_T: [*]f32,
-    att_g2_T: [*]f32,
-    att_v2_T: [*]f32, // only i > 0
-    att_v1_T: [*]f32, // only i > 0
-    att_v0: [*]f32, // only i > 0
-    att_k_k: [*]f32,
-    att_k_a: [*]f32,
+
+    // Time-mixing lerp coefficients: x_mixed = lerp(last_x, x, coeff)
+    att_x_r: [*]f32, // receptance mixing
+    att_x_w: [*]f32, // time-decay mixing
+    att_x_k: [*]f32, // key mixing
+    att_x_v: [*]f32, // value mixing
+    att_x_a: [*]f32, // bonus mixing
+    att_x_g: [*]f32, // output gate mixing
+
+    // Time-mixing parameters
+    att_w0: [*]f32, // base time-decay bias
+    att_r_k: [*]f32, // receptance-key interaction per head
+
+    // LoRA weight pairs (stored transposed for mat_mul_vec)
+    att_w1_T: [*]f32, // time-decay LoRA down-projection
+    att_w2_T: [*]f32, // time-decay LoRA up-projection
+    att_a1_T: [*]f32, // bonus LoRA down-projection
+    att_a2_T: [*]f32, // bonus LoRA up-projection
+    att_a0: [*]f32, // bonus bias
+    att_g1_T: [*]f32, // output gate LoRA down-projection
+    att_g2_T: [*]f32, // output gate LoRA up-projection
+
+    // Value blending LoRA — only present for layer > 0
+    att_v2_T: [*]f32,
+    att_v1_T: [*]f32,
+    att_v0: [*]f32,
+
+    // Key normalization and decay
+    att_k_k: [*]f32, // per-element key normalization scale
+    att_k_a: [*]f32, // key bonus decay coefficient
+
+    // Dense projection matrices (n_embd x n_embd)
     att_receptance_weight: [*]f32,
     att_key_weight: [*]f32,
     att_value_weight: [*]f32,
     att_output_weight: [*]f32,
+
+    // Per-head group norm inside wkv_kernel
     att_ln_x_weight: [*]f32,
     att_ln_x_bias: [*]f32,
-    ffn_x_k: [*]f32,
-    ffn_key_weight: [*]f32,
-    ffn_value_weight: [*]f32,
+
+    // Channel-mixing (FFN)
+    ffn_x_k: [*]f32, // lerp coefficient for FFN input mixing
+    ffn_key_weight: [*]f32, // (4*n_embd, n_embd) — squared-ReLU expansion
+    ffn_value_weight: [*]f32, // (n_embd, 4*n_embd) — projection back
 };
 
-/// RWKV7 model
+// ---------------------------------------------------------------------------
+// Model — loaded weights + inference methods
+// ---------------------------------------------------------------------------
+
 pub const Model = struct {
     const Self = @This();
 
     header: Header,
-    emb_weight: [*]f32,
-    blocks: []BlockWeights,
-    ln_out_weight: [*]f32,
+    emb_weight: [*]f32, // (vocab_size, n_embd) — with LN0 already merged in
+    blocks: []BlockWeights, // per-block weight pointers
+    ln_out_weight: [*]f32, // final layer norm
     ln_out_bias: [*]f32,
-    head_weight: [*]f32,
-    model_data: []align(std.heap.page_size_min) u8,
+    head_weight: [*]f32, // (vocab_size, n_embd) — language model head
+    model_data: []align(std.heap.page_size_min) u8, // raw weight buffer
 
     pub fn fromFile(io: Io, path: []const u8, allocator: Allocator) !Self {
         var model_file = try Io.Dir.cwd().openFile(io, path, .{});
@@ -201,14 +266,16 @@ pub const Model = struct {
         var buffer: [4096]u8 = undefined;
         var file_reader = model_file.reader(io, &buffer);
 
+        // Read 56-byte header
         const header_bytes = try allocator.alloc(u8, @sizeOf(Header));
         defer allocator.free(header_bytes);
         try file_reader.interface.readSliceAll(header_bytes);
         const header: Header = std.mem.bytesToValue(Header, header_bytes);
 
         assert(header.magic_number == MAGIC_NUMBER);
-        assert(header.quant == 0);
+        assert(header.quant == 0); // quantized models not supported
 
+        // Memory-map all remaining weight data (page-aligned for large model files)
         const model_data: []align(std.heap.page_size_min) u8 = blk: {
             const size = (try model_file.stat(io)).size;
             const weights_size: usize = size - @sizeOf(Header);
@@ -239,10 +306,12 @@ pub const Model = struct {
 
         model.blocks = try allocator.alloc(BlockWeights, n_layer);
 
+        // Walk through the flat weight buffer and assign pointers to each block.
+        // Order matches rwkv7.c load_model exactly.
         var ptr: [*]f32 = @ptrCast(@alignCast(data));
         model.emb_weight = ptr;
         ptr += vocab_size * n_embd;
-        // blocks_0 ln0 weight/bias (merged into emb_weight below)
+        // Block-0's LN0 weights — will be merged into emb_weight below
         const ln0_weight = ptr;
         ptr += n_embd;
         const ln0_bias = ptr;
@@ -250,14 +319,17 @@ pub const Model = struct {
 
         for (0..n_layer) |i| {
             const b = &model.blocks[i];
+            // Pre-attention layer norm
             b.ln1_weight = ptr;
             ptr += n_embd;
             b.ln1_bias = ptr;
             ptr += n_embd;
+            // Post-attention layer norm
             b.ln2_weight = ptr;
             ptr += n_embd;
             b.ln2_bias = ptr;
             ptr += n_embd;
+            // Time-mixing lerp coefficients
             b.att_x_r = ptr;
             ptr += n_embd;
             b.att_x_w = ptr;
@@ -270,10 +342,13 @@ pub const Model = struct {
             ptr += n_embd;
             b.att_x_g = ptr;
             ptr += n_embd;
+            // Time-decay base bias
             b.att_w0 = ptr;
             ptr += n_embd;
+            // Receptance-key interaction (per head)
             b.att_r_k = ptr;
             ptr += n_head * head_size;
+            // LoRA projections: w (time-decay), a (bonus), g (output gate)
             b.att_w1_T = ptr;
             ptr += n_embd * w_lora_r;
             b.att_w2_T = ptr;
@@ -288,6 +363,7 @@ pub const Model = struct {
             ptr += n_embd * g_lora_r;
             b.att_g2_T = ptr;
             ptr += g_lora_r * n_embd;
+            // Value blending LoRA — absent in layer 0 (v_lora only for i > 0)
             if (i != 0) {
                 b.att_v2_T = ptr;
                 ptr += v_lora_r * n_embd;
@@ -296,10 +372,12 @@ pub const Model = struct {
                 b.att_v0 = ptr;
                 ptr += n_embd;
             }
+            // Key normalization and bonus-decay coefficients
             b.att_k_k = ptr;
             ptr += n_embd;
             b.att_k_a = ptr;
             ptr += n_embd;
+            // Dense projections (n_embd x n_embd each)
             b.att_receptance_weight = ptr;
             ptr += n_embd * n_embd;
             b.att_key_weight = ptr;
@@ -308,10 +386,12 @@ pub const Model = struct {
             ptr += n_embd * n_embd;
             b.att_output_weight = ptr;
             ptr += n_embd * n_embd;
+            // Per-head group norm inside wkv_kernel
             b.att_ln_x_weight = ptr;
             ptr += n_embd;
             b.att_ln_x_bias = ptr;
             ptr += n_embd;
+            // Channel-mixing (FFN) weights
             b.ffn_x_k = ptr;
             ptr += n_embd;
             b.ffn_key_weight = ptr;
@@ -319,6 +399,7 @@ pub const Model = struct {
             b.ffn_value_weight = ptr;
             ptr += n_embd * 4 * n_embd;
         }
+        // Final layer norm and LM head
         model.ln_out_weight = ptr;
         ptr += n_embd;
         model.ln_out_bias = ptr;
@@ -326,7 +407,9 @@ pub const Model = struct {
         model.head_weight = ptr;
         ptr += n_embd * vocab_size;
 
-        // Merge ln0 into embedding weights (same as C: layer_norm on all vocab embeddings)
+        // Merge LN0 into embedding table — this is a one-time preprocessing step
+        // that avoids an extra layer_norm call during every forward pass.
+        // Equivalent to C's: layer_norm(emb_weight, emb_weight, ln0_w, ln0_b, ...)
         for (0..vocab_size) |vi| {
             const emb = model.emb_weight[vi * n_embd .. (vi + 1) * n_embd];
             var mean: f32 = 0.0;
@@ -344,7 +427,10 @@ pub const Model = struct {
             }
         }
 
-        // Transpose all LoRA weight matrices in-place
+        // Transpose all LoRA weight matrices in-place.
+        // The model file stores LoRA weights in PyTorch's (in, out) layout,
+        // but mat_mul_vec expects (out, in) row-major layout.
+        // A single tmp buffer is reused across all transposes.
         {
             const max_lora_dim = @max(n_embd * w_lora_r, @max(w_lora_r * n_embd, @max(n_embd * a_lora_r, @max(a_lora_r * n_embd, @max(n_embd * g_lora_r, @max(g_lora_r * n_embd, @max(n_embd * v_lora_r, v_lora_r * n_embd)))))));
             const tmp = try allocator.alloc(f32, max_lora_dim);
@@ -373,12 +459,21 @@ pub const Model = struct {
         self.* = undefined;
     }
 
+    /// Run the full RWKV-7 forward pass for a sequence of tokens.
+    /// Processes one token at a time (equivalent to C's seq_len=1 per step),
+    /// which is correct for the RNN recurrence — each token only depends on
+    /// the current input and the accumulated hidden state.
     pub fn forward(self: *const Self, token_list: []const u32, state: *RunState, logits: []f32) void {
         const c = self.header;
         const seq_len = token_list.len;
         const n_embd: usize = @intCast(c.n_embd);
         const n_layer: usize = @intCast(c.n_layer);
 
+        // Scratch layout (12 regions of n_embd each, used by time_mixing/channel_mixing):
+        //   [12..13) = x    (current token embedding)
+        //   [13..14) = x_   (layer-normed x)
+        //   [14..15) = dx   (sub-layer output delta)
+        //   [15..16) = v0   (first-layer value, used for v_lora blending)
         const x = state.scratch[12 * n_embd .. 13 * n_embd];
         const x_ = state.scratch[13 * n_embd .. 14 * n_embd];
         const dx = state.scratch[14 * n_embd .. 15 * n_embd];
@@ -386,27 +481,34 @@ pub const Model = struct {
 
         for (0..seq_len) |t| {
             const token = token_list[t];
+            // Look up embedding (LN0 already merged during model load)
             @memcpy(x, self.emb_weight[token * n_embd .. (token + 1) * n_embd]);
 
-            v0[0] = std.math.nan(f32); // Use NaN to track initialization inside time_mixing
+            // NaN sentinel: time_mixing uses this to detect first-layer initialization.
+            // Resets per token (matching C's local v0 in forward).
+            v0[0] = std.math.nan(f32);
 
             for (0..n_layer) |i| {
                 const b = &self.blocks[i];
+
+                // --- Time-mixing sub-layer ---
                 layer_norm(x_, x, b.ln1_weight[0..n_embd], b.ln1_bias[0..n_embd], 1e-5);
 
                 const last_x_offset = i * 2 * n_embd;
                 const state_offset = i * @as(usize, @intCast(@divTrunc(c.n_embd, c.head_size))) * @as(usize, @intCast(c.head_size)) * @as(usize, @intCast(c.head_size));
 
                 time_mixing(dx, x_, v0, state.last_x[last_x_offset .. last_x_offset + n_embd], state.wkv_state[state_offset..], self, b, state.scratch);
-                vec_add(x, x, dx);
+                vec_add(x, x, dx); // residual connection
 
+                // --- Channel-mixing sub-layer ---
                 layer_norm(x_, x, b.ln2_weight[0..n_embd], b.ln2_bias[0..n_embd], 1e-5);
 
                 const last_x_ffn_offset = i * 2 * n_embd + n_embd;
                 channel_mixing(dx, x_, state.last_x[last_x_ffn_offset .. last_x_ffn_offset + n_embd], b, state.scratch);
-                vec_add(x, x, dx);
+                vec_add(x, x, dx); // residual connection
             }
 
+            // Compute logits only for the last token in the sequence
             if (t == seq_len - 1) {
                 layer_norm(x, x, self.ln_out_weight[0..n_embd], self.ln_out_bias[0..n_embd], 1e-5);
                 mat_mul_vec(logits, x, self.head_weight[0 .. n_embd * @as(usize, @intCast(c.vocab_size))]);
@@ -415,17 +517,27 @@ pub const Model = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// wkv_kernel — multi-head WKV recurrence (the core of RWKV-7)
+// ---------------------------------------------------------------------------
+
+/// Implements the WKV (Weighted Key-Value) recurrence from the RWKV-7 paper:
+///   S = S * diag(w) - S @ kk @ (kk * a).mT + v * k.mT   (state update)
+///   y = group_norm(S @ r) + (r . (k * r_k)) * v           (output)
+///
+/// This is equivalent to linear attention with a learned time-decay (w),
+/// but computed as an O(n) recurrence rather than O(n^2) attention.
 pub fn wkv_kernel(
     y: []f32,
     model: *const Model,
     bw: *const BlockWeights,
     state: []f32,
-    r: []const f32,
-    w: []const f32,
-    k: []const f32,
-    v: []const f32,
-    kk: []f32,
-    a: []const f32,
+    r: []const f32, // receptance
+    w: []const f32, // time-decay (exp of learned sigmoid)
+    k: []const f32, // key (modified with a-1 bonus)
+    v: []const f32, // value (optionally blended with v0)
+    kk: []f32, // normalized key (k * k_k, then L2-normalized)
+    a: []const f32, // bonus gate (sigmoid output)
 ) void {
     const c = model.header;
     const n_embd: usize = @intCast(c.n_embd);
@@ -446,38 +558,45 @@ pub fn wkv_kernel(
         const ln_b = bw.att_ln_x_bias[i * head_size .. (i + 1) * head_size];
         const r_k = bw.att_r_k[i * head_size .. (i + 1) * head_size];
 
+        // L2-normalize kk: kk /= max(||kk||, 1e-12)
         var kk_norm = vec_dot_product(head_kk, head_kk);
         kk_norm = std.math.sqrt(kk_norm);
         vec_scale(head_kk, head_kk, 1.0 / @max(kk_norm, 1e-12));
 
+        // State update: S = S * w.mT - S@kk * (kk*a).mT + v * k.mT
+        // Decomposed to avoid non-contiguous column-vector access.
         {
             var tmp_buf: [1024]f32 = undefined;
-            const smk = tmp_buf[0..head_size];
+            const smk = tmp_buf[0..head_size]; // S @ kk
             mat_mul_vec(smk, head_kk, head_state);
 
-            const kma = tmp_buf[head_size .. 2 * head_size];
+            const kma = tmp_buf[head_size .. 2 * head_size]; // kk * a
             vec_hadamard(kma, head_kk, head_a);
 
             var tmp2_buf: [65536]f32 = undefined;
-            const t = tmp2_buf[0 .. head_size * head_size];
+            const t = tmp2_buf[0 .. head_size * head_size]; // (S@kk) outer (kk*a)
             vec_out_product(t, smk, kma);
 
-            const vmk = tmp2_buf[head_size * head_size .. 2 * head_size * head_size];
+            const vmk = tmp2_buf[head_size * head_size .. 2 * head_size * head_size]; // v outer k
             vec_out_product(vmk, head_v, head_k);
 
+            // S = S * diag(w) — multiply each row of S by the decay vector
             for (0..head_size) |j| {
                 const state_row = head_state[j * head_size .. (j + 1) * head_size];
                 vec_hadamard(state_row, state_row, head_w);
             }
 
-            vec_sub(head_state, head_state, t);
-            vec_add(head_state, head_state, vmk);
+            vec_sub(head_state, head_state, t); // S -= (S@kk) * (kk*a).mT
+            vec_add(head_state, head_state, vmk); // S += v * k.mT
         }
 
+        // y = S @ r
         mat_mul_vec(head_y, head_r, head_state);
 
+        // y = group_norm(y, ln_w, ln_b)
         layer_norm(head_y, head_y, ln_w, ln_b, 64e-5);
 
+        // y += (r . (k * r_k)) * v — bonus output from receptance-key interaction
         {
             var tmp_buf: [1024]f32 = undefined;
             const kmrk = tmp_buf[0..head_size];
@@ -491,38 +610,51 @@ pub fn wkv_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// time_mixing — attention sub-layer
+// ---------------------------------------------------------------------------
+
+/// Time-mixing: the RWKV-7 attention analogue.
+///
+/// For each of {r, w, k, v, a, g}, the input is a lerp of the current token (x)
+/// and the previous token (last_x) using learned mixing coefficients.
+/// Then LoRA projections and the WKV recurrence produce the output.
+///
+/// The v_lora mechanism blends the current v with a persistent v0 (from layer 0)
+/// using a learned sigmoid gate — this gives the model a form of "long-term memory"
+/// that persists across all layers.
 pub fn time_mixing(
     dx: []f32,
-    x: []const f32, // n_embd
-    v0: []f32, // n_embd
-    last_x: []f32, // n_embd
-    state: []f32,
+    x: []const f32, // layer-normed input (n_embd)
+    v0: []f32, // persistent value from layer 0 (n_embd), NaN on first call
+    last_x: []f32, // previous token's input (n_embd)
+    state: []f32, // WKV recurrence state for this layer
     model: *const Model,
     bw: *const BlockWeights,
-    scratch: []f32,
+    scratch: []f32, // shared scratch buffer (12 * n_embd)
 ) void {
     const c = model.header;
     const n_embd: usize = @intCast(c.n_embd);
 
-    // allocate from scratch
-    const x_lerp = scratch[0..n_embd];
-    const r = scratch[n_embd .. 2 * n_embd];
-    const w = scratch[2 * n_embd .. 3 * n_embd];
-    const k = scratch[3 * n_embd .. 4 * n_embd];
-    const v = scratch[4 * n_embd .. 5 * n_embd];
-    const kk = scratch[5 * n_embd .. 6 * n_embd];
-    const a = scratch[6 * n_embd .. 7 * n_embd];
-    const g = scratch[7 * n_embd .. 8 * n_embd];
-    const w_sigmoid = scratch[8 * n_embd .. 9 * n_embd];
-    const v_sigmoid = scratch[9 * n_embd .. 10 * n_embd];
-    const a_minus_1 = scratch[10 * n_embd .. 11 * n_embd];
-    const y = scratch[11 * n_embd .. 12 * n_embd];
+    // Scratch sub-allocation (each region is n_embd floats):
+    const x_lerp = scratch[0..n_embd]; // lerped input (reused per gate)
+    const r = scratch[n_embd .. 2 * n_embd]; // receptance
+    const w = scratch[2 * n_embd .. 3 * n_embd]; // time-decay
+    const k = scratch[3 * n_embd .. 4 * n_embd]; // key
+    const v = scratch[4 * n_embd .. 5 * n_embd]; // value
+    const kk = scratch[5 * n_embd .. 6 * n_embd]; // normalized key
+    const a = scratch[6 * n_embd .. 7 * n_embd]; // bonus gate
+    const g = scratch[7 * n_embd .. 8 * n_embd]; // output gate
+    const w_sigmoid = scratch[8 * n_embd .. 9 * n_embd]; // w before exp
+    const v_sigmoid = scratch[9 * n_embd .. 10 * n_embd]; // v blending gate
+    const a_minus_1 = scratch[10 * n_embd .. 11 * n_embd]; // temp for k bonus
+    const y = scratch[11 * n_embd .. 12 * n_embd]; // WKV output
 
-    // r = Wr @ xr
+    // r = Wr @ lerp(last_x, x, x_r)
     lerp(x_lerp, last_x, x, bw.att_x_r[0..n_embd]);
     mat_mul_vec(r, x_lerp, bw.att_receptance_weight[0 .. n_embd * n_embd]);
 
-    // w = np.exp(-sigmoid(...) / np.e**0.5)
+    // w = exp(-sigmoid(tanh(xw @ Ww1) @ Ww2 + w0) / sqrt(e))
     lerp(x_lerp, last_x, x, bw.att_x_w[0..n_embd]);
     const w_lora_r: usize = @intCast(c.w_lora_r);
     const w1_T = bw.att_w1_T[0 .. n_embd * w_lora_r];
@@ -531,17 +663,20 @@ pub fn time_mixing(
     vec_add(w_sigmoid, w_sigmoid, bw.att_w0[0..n_embd]);
     vec_sigm(w_sigmoid);
     for (0..n_embd) |i| {
-        w[i] = std.math.exp(-w_sigmoid[i] / 1.6487212707);
-    } // 1.6487... = sqrt(e)
+        w[i] = std.math.exp(-w_sigmoid[i] / 1.6487212707); // 1.6487... = sqrt(e)
+    }
 
-    // k = Wk @ xk
+    // k = Wk @ lerp(last_x, x, x_k)
     lerp(x_lerp, last_x, x, bw.att_x_k[0..n_embd]);
     mat_mul_vec(k, x_lerp, bw.att_key_weight[0 .. n_embd * n_embd]);
 
-    // v = Wv @ xv
+    // v = Wv @ lerp(last_x, x, x_v)
     lerp(x_lerp, last_x, x, bw.att_x_v[0..n_embd]);
     mat_mul_vec(v, x_lerp, bw.att_value_weight[0 .. n_embd * n_embd]);
 
+    // v_lora: blend v with persistent v0 using a sigmoid gate.
+    // On the very first call (layer 0 of first token), v0 is NaN → just copy v.
+    // On subsequent layers, v = lerp(v0, v, sigmoid(lora(x_lerp) + v0_bias)).
     if (std.math.isNan(v0[0])) {
         @memcpy(v0, v);
     } else {
@@ -554,10 +689,10 @@ pub fn time_mixing(
         lerp(v, v0, v, v_sigmoid);
     }
 
-    // kk = k * k_k
+    // kk = k * k_k (element-wise key normalization scale)
     vec_hadamard(kk, k, bw.att_k_k[0..n_embd]);
 
-    // a = sigmoid(...)
+    // a = sigmoid(xa @ Wa1 @ Wa2 + a0) — bonus gate
     lerp(x_lerp, last_x, x, bw.att_x_a[0..n_embd]);
     const a_lora_r: usize = @intCast(c.a_lora_r);
     const a1_T = bw.att_a1_T[0 .. n_embd * a_lora_r];
@@ -566,56 +701,78 @@ pub fn time_mixing(
     vec_add(a, a, bw.att_a0[0..n_embd]);
     vec_sigm(a);
 
-    // g = sigmoid(xg @ Wg1) @ Wg2
+    // g = sigmoid(xg @ Wg1) @ Wg2 — output gate
     lerp(x_lerp, last_x, x, bw.att_x_g[0..n_embd]);
     const g_lora_r: usize = @intCast(c.g_lora_r);
     const g1_T = bw.att_g1_T[0 .. n_embd * g_lora_r];
     const g2_T = bw.att_g2_T[0 .. g_lora_r * n_embd];
     lora(g, x_lerp, g1_T, g2_T, .SIGM);
 
-    // k += k * (a-1) * k_a
+    // k += k * (a - 1) * k_a — apply bonus decay to keys
     @memcpy(a_minus_1, a);
     vec_bias(a_minus_1, a_minus_1, -1.0);
     vec_hadamard(a_minus_1, a_minus_1, bw.att_k_a[0..n_embd]);
     vec_hadamard(a_minus_1, k, a_minus_1);
     vec_add(k, k, a_minus_1);
 
-    // wkv_kernel
+    // WKV recurrence — updates state in-place and produces y
     wkv_kernel(y, model, bw, state, r, w, k, v, kk, a);
 
-    // dx = Wo @ (y * g)
+    // dx = Wo @ (y * g) — output projection with gating
     vec_hadamard(y, y, g);
     mat_mul_vec(dx, y, bw.att_output_weight[0 .. n_embd * n_embd]);
 
-    // last_x = x
+    // Save current input for next token's lerp
     @memcpy(last_x, x);
 }
 
+// ---------------------------------------------------------------------------
+// channel_mixing — FFN sub-layer
+// ---------------------------------------------------------------------------
+
+/// Channel-mixing: squared-ReLU feed-forward network.
+///   xk = lerp(last_x, x, ffn_x_k)
+///   k = (ReLU(Wk @ xk))^2
+///   dx = Wv @ k
 pub fn channel_mixing(
     dx: []f32,
-    x: []const f32, // n_embd
-    last_x: []f32, // n_embd
+    x: []const f32, // layer-normed input (n_embd)
+    last_x: []f32, // previous token's input (n_embd)
     bw: *const BlockWeights,
     scratch: []f32,
 ) void {
     const n_embd = x.len;
 
     const xk = scratch[0..n_embd];
-    const k = scratch[n_embd .. 5 * n_embd]; // 4 * n_embd
+    const k = scratch[n_embd .. 5 * n_embd]; // 4 * n_embd for expanded FFN
 
+    // xk = lerp(last_x, x, ffn_x_k)
     lerp(xk, last_x, x, bw.ffn_x_k[0..n_embd]);
+
+    // k = Wk @ xk — project to 4x hidden dim
     mat_mul_vec(k, xk, bw.ffn_key_weight[0 .. n_embd * n_embd * 4]);
 
+    // k = (ReLU(k))^2 — squared ReLU activation
     for (0..4 * n_embd) |i| {
         const relu_k = @max(k[i], 0.0);
         k[i] = relu_k * relu_k;
     }
 
+    // dx = Wv @ k — project back to hidden dim
     mat_mul_vec(dx, k, bw.ffn_value_weight[0 .. n_embd * 4 * n_embd]);
 
+    // Save current input for next token's lerp
     @memcpy(last_x, x);
 }
 
+// ---------------------------------------------------------------------------
+// SIMD vector primitives
+// ---------------------------------------------------------------------------
+// All functions below process DEFAULT_VECTOR_WIDTH elements per iteration
+// using Zig's @Vector type, which compiles to single SIMD instructions
+// (e.g., vaddps, vmulps, vfmaddps on x86-64 AVX2+FMA).
+
+/// xout = a + b (element-wise)
 pub fn vec_add(xout: []f32, a: []const f32, b: []const f32) void {
     assert(xout.len == a.len and a.len == b.len);
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
@@ -630,6 +787,7 @@ pub fn vec_add(xout: []f32, a: []const f32, b: []const f32) void {
     }
 }
 
+/// xout = a - b (element-wise)
 pub fn vec_sub(xout: []f32, a: []const f32, b: []const f32) void {
     assert(xout.len == a.len and a.len == b.len);
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
@@ -644,6 +802,7 @@ pub fn vec_sub(xout: []f32, a: []const f32, b: []const f32) void {
     }
 }
 
+/// xout = a * b (Hadamard / element-wise product)
 pub fn vec_hadamard(xout: []f32, a: []const f32, b: []const f32) void {
     assert(xout.len == a.len and a.len == b.len);
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
@@ -658,6 +817,7 @@ pub fn vec_hadamard(xout: []f32, a: []const f32, b: []const f32) void {
     }
 }
 
+/// xout = a + b (broadcast scalar b across all elements)
 pub fn vec_bias(xout: []f32, a: []const f32, b: f32) void {
     assert(xout.len == a.len);
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
@@ -672,6 +832,7 @@ pub fn vec_bias(xout: []f32, a: []const f32, b: f32) void {
     }
 }
 
+/// xout = a * b (broadcast scalar b across all elements)
 pub fn vec_scale(xout: []f32, a: []const f32, b: f32) void {
     assert(xout.len == a.len);
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
@@ -686,6 +847,7 @@ pub fn vec_scale(xout: []f32, a: []const f32, b: f32) void {
     }
 }
 
+/// Dot product: sum(a[i] * b[i]). Uses FMA accumulation for accuracy and speed.
 pub fn vec_dot_product(a: []const f32, b: []const f32) f32 {
     assert(a.len == b.len);
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
@@ -694,20 +856,21 @@ pub fn vec_dot_product(a: []const f32, b: []const f32) f32 {
     while (i + DEFAULT_VECTOR_WIDTH <= a.len) : (i += DEFAULT_VECTOR_WIDTH) {
         const av: V = a[i..][0..DEFAULT_VECTOR_WIDTH].*;
         const bv: V = b[i..][0..DEFAULT_VECTOR_WIDTH].*;
-        acc = @mulAdd(V, av, bv, acc);
+        acc = @mulAdd(V, av, bv, acc); // acc += a * b (fused multiply-add)
     }
-    var ret = @reduce(.Add, acc);
+    var ret = @reduce(.Add, acc); // horizontal sum of accumulator
     while (i < a.len) : (i += 1) {
         ret += a[i] * b[i];
     }
     return ret;
 }
 
+/// Outer product: xout[i,j] = a[i] * b[j]. Inner loop is SIMD-vectorized.
 pub fn vec_out_product(xout: []f32, a: []const f32, b: []const f32) void {
     assert(xout.len == a.len * b.len);
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
     for (0..a.len) |i| {
-        const av: V = @splat(a[i]);
+        const av: V = @splat(a[i]); // broadcast a[i] across vector
         var j: usize = 0;
         while (j + DEFAULT_VECTOR_WIDTH <= b.len) : (j += DEFAULT_VECTOR_WIDTH) {
             const bv: V = b[j..][0..DEFAULT_VECTOR_WIDTH].*;
@@ -719,6 +882,7 @@ pub fn vec_out_product(xout: []f32, a: []const f32, b: []const f32) void {
     }
 }
 
+/// Sum of all elements. Uses SIMD accumulation + horizontal reduce.
 pub fn vec_sum(x: []const f32) f32 {
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
     var acc: V = @splat(@as(f32, 0.0));
@@ -734,6 +898,8 @@ pub fn vec_sum(x: []const f32) f32 {
     return ret;
 }
 
+/// Linear interpolation: xout = b + mu * (a - b).
+/// Uses FMA: @mulAdd(mu, a - b, b) compiles to vfmaddps on FMA-capable hardware.
 pub fn lerp(xout: []f32, a: []const f32, b: []const f32, mu: []const f32) void {
     assert(xout.len == a.len and a.len == b.len and b.len == mu.len);
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
@@ -749,18 +915,23 @@ pub fn lerp(xout: []f32, a: []const f32, b: []const f32, mu: []const f32) void {
     }
 }
 
+/// Element-wise sigmoid: x[i] = 1 / (1 + exp(-x[i])).
+/// Not SIMD-vectorized (matches C — exp() is the bottleneck).
 pub fn vec_sigm(x: []f32) void {
     for (x) |*v| {
         v.* = 1.0 / (1.0 + std.math.exp(-v.*));
     }
 }
 
+/// Element-wise tanh. Not SIMD-vectorized (matches C).
 pub fn vec_tanh(x: []f32) void {
     for (x) |*v| {
         v.* = std.math.tanh(v.*);
     }
 }
 
+/// Matrix-vector multiply: xout = W @ x, where W is (d, n) row-major.
+/// Each output element is a SIMD-accelerated dot product of a W row with x.
 pub fn mat_mul_vec(xout: []f32, x: []const f32, w: []const f32) void {
     const d = xout.len;
     const n = x.len;
@@ -770,6 +941,9 @@ pub fn mat_mul_vec(xout: []f32, x: []const f32, w: []const f32) void {
     }
 }
 
+/// Layer normalization (actually group norm in RWKV — applied per-head).
+///   xout = (x - mean) / sqrt(var + eps) * weight + bias
+/// Three passes: mean, variance (FMA), then transform (FMA).
 pub fn layer_norm(xout: []f32, x: []const f32, weight: []const f32, bias: []const f32, eps: f32) void {
     const len = x.len;
     const x_mean = vec_sum(x) / @as(f32, @floatFromInt(len));
@@ -777,12 +951,13 @@ pub fn layer_norm(xout: []f32, x: []const f32, weight: []const f32, bias: []cons
     const V = @Vector(DEFAULT_VECTOR_WIDTH, f32);
     const mean_v: V = @splat(x_mean);
 
+    // Pass 2: compute variance using FMA accumulation
     var acc: V = @splat(@as(f32, 0.0));
     var i: usize = 0;
     while (i + DEFAULT_VECTOR_WIDTH <= len) : (i += DEFAULT_VECTOR_WIDTH) {
         const xv: V = x[i..][0..DEFAULT_VECTOR_WIDTH].*;
         const diff = xv - mean_v;
-        acc = @mulAdd(V, diff, diff, acc);
+        acc = @mulAdd(V, diff, diff, acc); // acc += diff^2
     }
     var x_var = @reduce(.Add, acc);
     while (i < len) : (i += 1) {
@@ -794,6 +969,7 @@ pub fn layer_norm(xout: []f32, x: []const f32, weight: []const f32, bias: []cons
     const scale = 1.0 / std.math.sqrt(x_var + eps);
     const scale_v: V = @splat(scale);
 
+    // Pass 3: normalize, scale, shift — single FMA chain
     i = 0;
     while (i + DEFAULT_VECTOR_WIDTH <= len) : (i += DEFAULT_VECTOR_WIDTH) {
         const xv: V = x[i..][0..DEFAULT_VECTOR_WIDTH].*;
@@ -806,15 +982,20 @@ pub fn layer_norm(xout: []f32, x: []const f32, weight: []const f32, bias: []cons
     }
 }
 
+// ---------------------------------------------------------------------------
+// LoRA helper
+// ---------------------------------------------------------------------------
+
 pub const LoraAct = enum { NONE, TANH, SIGM };
 
-/// Lora computation
+/// Low-Rank Adaptation: xout = W2 @ act(W1 @ x).
+/// Used for time-decay (w), bonus (a), output gate (g), and value blend (v) gates.
 pub fn lora(xout: []f32, x: []const f32, weight_1: []const f32, weight_2: []const f32, act: LoraAct) void {
     const lora_rank = weight_1.len / x.len;
     var tmp_buf: [4096]f32 = undefined;
     const tmp = tmp_buf[0..lora_rank];
 
-    mat_mul_vec(tmp, x, weight_1);
+    mat_mul_vec(tmp, x, weight_1); // down-project: (lora_rank,)
 
     switch (act) {
         .NONE => {},
@@ -822,10 +1003,15 @@ pub fn lora(xout: []f32, x: []const f32, weight_1: []const f32, weight_2: []cons
         .SIGM => vec_sigm(tmp),
     }
 
-    mat_mul_vec(xout, tmp, weight_2);
+    mat_mul_vec(xout, tmp, weight_2); // up-project: (n_embd,)
 }
 
-/// In-place matrix transpose: mat(rows, cols) -> mat(cols, rows)
+// ---------------------------------------------------------------------------
+// Matrix transpose
+// ---------------------------------------------------------------------------
+
+/// In-place matrix transpose: mat(rows, cols) -> mat(cols, rows).
+/// Uses a caller-provided temporary buffer to avoid heap allocation.
 fn matTranspose(mat: [*]f32, rows: usize, cols: usize, tmp: []f32) void {
     const n = rows * cols;
     assert(n <= tmp.len);
