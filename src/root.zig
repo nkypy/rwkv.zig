@@ -128,6 +128,106 @@ pub const Tokenizer = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Thread pool for parallel mat_mul_vec
+// ---------------------------------------------------------------------------
+
+/// Persistent thread pool using phase counter for synchronization.
+/// Workers spin on a phase counter; when it flips, work is available.
+pub const ThreadPool = struct {
+    const State = enum(u8) { idle = 0, work = 1, shutdown = 2 };
+
+    xout_ptr: [*]f32 = undefined,
+    x_ptr: [*]const f32 = undefined,
+    w_ptr: [*]const f32 = undefined,
+    n_cols: usize = 0,
+    d_rows: usize = 0,
+
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    finished: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    total_workers: usize,
+    threads: []std.Thread,
+
+    pub fn init(allocator: Allocator, n_threads: usize) !*ThreadPool {
+        const pool = try allocator.create(ThreadPool);
+        pool.* = .{
+            .total_workers = n_threads,
+            .threads = try allocator.alloc(std.Thread, n_threads),
+        };
+        for (0..n_threads) |i| {
+            pool.threads[i] = try std.Thread.spawn(.{}, workerLoop, .{ pool, i });
+        }
+        return pool;
+    }
+
+    pub fn deinit(self: *ThreadPool, allocator: Allocator) void {
+        self.state.store(@intFromEnum(State.shutdown), .release);
+        for (self.threads) |t| t.join();
+        allocator.free(self.threads);
+        allocator.destroy(self);
+    }
+
+    fn workerLoop(pool: *ThreadPool, worker_id: usize) void {
+        while (true) {
+            // Spin-wait with periodic yield to avoid burning too much CPU
+            var spin: u32 = 0;
+            while (pool.state.load(.acquire) == @intFromEnum(State.idle)) {
+                spin +%= 1;
+                if (spin > 1024) {
+                    std.Thread.yield() catch {};
+                    spin = 0;
+                }
+            }
+            if (pool.state.load(.acquire) == @intFromEnum(State.shutdown)) return;
+
+            // Read work parameters and compute my portion
+            const d = pool.d_rows;
+            const n = pool.n_cols;
+            const chunk = d / pool.total_workers;
+            const start = worker_id * chunk;
+            const end = if (worker_id == pool.total_workers - 1) d else start + chunk;
+
+            const xout = pool.xout_ptr;
+            const x = pool.x_ptr;
+            const w = pool.w_ptr;
+            for (start..end) |i| {
+                xout[i] = vec_dot_product(w[i * n .. (i + 1) * n], x[0..n]);
+            }
+
+            _ = pool.finished.fetchAdd(1, .release);
+        }
+    }
+
+    pub fn matmul(self: *ThreadPool, xout: []f32, x: []const f32, w: []const f32) void {
+        const d = xout.len;
+        const n = x.len;
+
+        // Publish work parameters
+        self.xout_ptr = xout.ptr;
+        self.x_ptr = x.ptr;
+        self.w_ptr = w.ptr;
+        self.n_cols = n;
+        self.d_rows = d;
+        self.finished.store(0, .release);
+
+        // Signal workers
+        self.state.store(@intFromEnum(State.work), .release);
+
+        // Thread 0 does rows [0, chunk)
+        const chunk = d / self.total_workers;
+        const x_slice = x[0..n];
+        for (0..chunk) |i| {
+            xout[i] = vec_dot_product(w[i * n .. (i + 1) * n], x_slice);
+        }
+
+        // Wait for workers to finish
+        while (self.finished.load(.acquire) < self.total_workers - 1) {}
+
+        // Reset to idle
+        self.state.store(@intFromEnum(State.idle), .release);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // RunState — persistent hidden state across token generations
 // ---------------------------------------------------------------------------
 
@@ -148,6 +248,9 @@ pub const RunState = struct {
     /// Size: 32 * n_embd floats, sub-allocated into ~12 named regions.
     scratch: []align(simd_align) f32,
 
+    /// Optional thread pool for parallel mat_mul_vec.
+    pool: ?*ThreadPool = null,
+
     pub fn init(allocator: Allocator, model: *const Model) !Self {
         const n_layer: usize = @intCast(model.header.n_layer);
         const n_embd: usize = @intCast(model.header.n_embd);
@@ -160,7 +263,13 @@ pub const RunState = struct {
         };
     }
 
+    pub fn initThreadPool(self: *Self, allocator: Allocator, n_threads: usize) !void {
+        self.pool = try ThreadPool.init(allocator, n_threads);
+        global_pool = self.pool;
+    }
+
     pub fn deinit(self: *Self, allocator: Allocator) void {
+        if (self.pool) |p| p.deinit(allocator);
         allocator.free(self.last_x);
         allocator.free(self.wkv_state);
         allocator.free(self.scratch);
@@ -930,12 +1039,24 @@ pub fn vec_tanh(x: []f32) void {
     }
 }
 
+/// Optional global thread pool pointer, set once at init time.
+/// mat_mul_vec checks this to decide whether to parallelize.
+var global_pool: ?*ThreadPool = null;
+
 /// Matrix-vector multiply: xout = W @ x, where W is (d, n) row-major.
 /// Each output element is a SIMD-accelerated dot product of a W row with x.
+/// Uses thread pool when available and d is large enough to justify overhead.
 pub fn mat_mul_vec(xout: []f32, x: []const f32, w: []const f32) void {
     const d = xout.len;
     const n = x.len;
     assert(w.len == d * n);
+    // Use parallel path only for large matrices (threshold: 256 rows)
+    if (global_pool) |pool| {
+        if (d >= 256) {
+            pool.matmul(xout, x, w);
+            return;
+        }
+    }
     for (0..d) |i| {
         xout[i] = vec_dot_product(w[i * n .. (i + 1) * n], x);
     }

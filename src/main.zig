@@ -142,6 +142,7 @@ const usage_text: []const u8 =
     \\ -s, --seed <int>          random seed, default to system time
     \\ -z, --tokenizer <path>    path to the tokenizer file, default "tokenizer.bin"
     \\ -v, --verbose             print model info and tokens/s
+    \\ -j, --threads <int>       number of threads for mat_mul_vec (default: 1, helps on larger models)
     \\ --presence_penalty <float>  presence penalty, default 0.1
     \\ --frequency_penalty <float> frequency penalty, default 0.2
     \\
@@ -167,6 +168,7 @@ pub fn main(init: std.process.Init) !void {
     var presence_penalty: f32 = 0.1;
     var frequency_penalty: f32 = 0.2;
     var seq_len: usize = 0;
+    var n_threads: usize = 1; // default single-threaded; use -j to enable parallelism
     var seed: u64 = @bitCast(Io.Clock.now(.real, io).toSeconds());
     var tokenizer_path: []const u8 = "tokenizer.bin";
     prng = std.Random.DefaultPrng.init(seed);
@@ -250,6 +252,18 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             prng = std.Random.DefaultPrng.init(seed);
+        } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--threads")) {
+            arg_i += 1;
+            if (arg_i >= args.len) {
+                std.debug.print("error: missing argument for threads\n", .{});
+                std.process.exit(1);
+            }
+            n_threads = std.fmt.parseInt(usize, args[arg_i], 10) catch |err| {
+                std.debug.print("unable to parse --threads argument '{s}': {s}\n", .{
+                    args[arg_i], @errorName(err),
+                });
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, arg, "-z") or std.mem.eql(u8, arg, "--tokenizer")) {
             arg_i += 1;
             if (arg_i >= args.len) {
@@ -315,9 +329,14 @@ pub fn main(init: std.process.Init) !void {
     const tokenizer = try rwkv.Tokenizer.fromFile(io, tokenizer_path, allocator);
     defer tokenizer.deinit(allocator);
 
-    // Initialize hidden state (zero-filled)
+    // Initialize hidden state (zero-filled) and thread pool
     var state = try rwkv.RunState.init(allocator, &rwkv_model);
     defer state.deinit(allocator);
+
+    if (n_threads > 1) {
+        try state.initThreadPool(allocator, n_threads);
+        log("using {d} threads\n", .{n_threads});
+    }
 
     @memset(state.last_x, 0.0);
     @memset(state.wkv_state, 0.0);
