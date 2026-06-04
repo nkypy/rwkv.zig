@@ -305,6 +305,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var next: usize = undefined;
+    var prev_was_newline: bool = false; // track consecutive newlines
     const start_time = Io.Clock.now(.real, io);
 
     seq_len = if (seq_len == 0) 256 else seq_len;
@@ -366,6 +367,16 @@ pub fn main(init: std.process.Init) !void {
 
         // Print the generated token and flush immediately for streaming output
         const token_str = tokenizer.tokens[next];
+
+        // Stop on double newline: either a single "\n\n" token,
+        // or two consecutive "\n" tokens.
+        const is_newline = token_str.len == 1 and token_str[0] == '\n';
+        const is_double_newline = token_str.len >= 2 and token_str[0] == '\n' and token_str[1] == '\n';
+        if (is_double_newline or (is_newline and prev_was_newline)) {
+            break;
+        }
+        prev_was_newline = is_newline;
+
         try stdout.print("{s}", .{token_str});
         try stdout.flush();
 
