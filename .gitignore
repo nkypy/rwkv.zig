@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+.claude/
+*.o
+*.bin
+*.pth
+*.txt
+.DS_Store
