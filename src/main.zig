@@ -142,6 +142,8 @@ const usage_text: []const u8 =
     \\ -s, --seed <int>          random seed, default to system time
     \\ -z, --tokenizer <path>    path to the tokenizer file, default "tokenizer.bin"
     \\ -v, --verbose             print model info and tokens/s
+    \\ --presence_penalty <float>  presence penalty, default 0.1
+    \\ --frequency_penalty <float> frequency penalty, default 0.2
     \\
 ;
 
@@ -162,6 +164,8 @@ pub fn main(init: std.process.Init) !void {
     var input: ?[]const u8 = null;
     var temperature: f32 = 1.0;
     var top_p: f32 = 0.9;
+    var presence_penalty: f32 = 0.1;
+    var frequency_penalty: f32 = 0.2;
     var seq_len: usize = 0;
     var seed: u64 = @bitCast(Io.Clock.now(.real, io).toSeconds());
     var tokenizer_path: []const u8 = "tokenizer.bin";
@@ -253,6 +257,30 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             tokenizer_path = args[arg_i];
+        } else if (std.mem.eql(u8, arg, "--presence_penalty")) {
+            arg_i += 1;
+            if (arg_i >= args.len) {
+                std.debug.print("error: missing argument for presence_penalty\n", .{});
+                std.process.exit(1);
+            }
+            presence_penalty = std.fmt.parseFloat(f32, args[arg_i]) catch |err| {
+                std.debug.print("unable to parse --presence_penalty argument '{s}': {s}\n", .{
+                    args[arg_i], @errorName(err),
+                });
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--frequency_penalty")) {
+            arg_i += 1;
+            if (arg_i >= args.len) {
+                std.debug.print("error: missing argument for frequency_penalty\n", .{});
+                std.process.exit(1);
+            }
+            frequency_penalty = std.fmt.parseFloat(f32, args[arg_i]) catch |err| {
+                std.debug.print("unable to parse --frequency_penalty argument '{s}': {s}\n", .{
+                    args[arg_i], @errorName(err),
+                });
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
         } else {
@@ -316,6 +344,11 @@ pub fn main(init: std.process.Init) !void {
     const logits_indexed = try allocator.alloc(IndexedF32, vocab_size);
     defer allocator.free(logits_indexed);
 
+    // Repetition penalty tracking: occurrence count per token
+    const occurrence = try allocator.alloc(f32, vocab_size);
+    defer allocator.free(occurrence);
+    @memset(occurrence, 0.0);
+
     var pos: usize = 0;
 
     // --- Prefill phase: process the entire prompt in one forward pass ---
@@ -345,6 +378,12 @@ pub fn main(init: std.process.Init) !void {
 
     // --- Decode phase: autoregressive token generation ---
     while (pos < seq_len) : (pos += 1) {
+        // Apply repetition penalty to logits (before temperature/sampling)
+        // Formula: logits[i] -= presence_penalty + occurrence[i] * frequency_penalty
+        for (logits, 0..) |*val, i| {
+            val.* -= presence_penalty + occurrence[i] * frequency_penalty;
+        }
+
         // Sample next token
         if (temperature == 0.0) {
             next = argmax(logits);
@@ -358,6 +397,12 @@ pub fn main(init: std.process.Init) !void {
             else
                 sample_top_p(logits, top_p, logits_indexed);
         }
+
+        // Update occurrence tracking (matching C: decay by presence_penalty, increment by 1)
+        for (occurrence) |*val| {
+            val.* *= presence_penalty;
+        }
+        occurrence[next] += 1.0;
 
         // EOS token (id 0) signals end of generation
         if (next == 0) {
